@@ -6,8 +6,14 @@ import signale from "signale";
 import MessageComposer from "./composer";
 import Identifier from "./identifier";
 import Channels from "./channels";
+import { ApiClient } from "twitch/lib";
 
 export default class MessageHandler {
+    /**
+     * Twitch API Client Instance
+     */
+    public api?: ApiClient;
+
     constructor(private channels: Channels, private composer: MessageComposer, private identifier: Identifier) {}
 
     /**
@@ -17,18 +23,31 @@ export default class MessageHandler {
      * @param sender User who sent the Message
      * @param client Twitch client instance
      */
-    public handle(channel: string, message: string, user: ChatUser, client: ChatClient): void | Promise<void> {
+    public async handle(channel: string, message: string, user: ChatUser, client: ChatClient): Promise<void> {
         channel = channel.toLowerCase().replace("#", "");
 
-        const isHostChannel = ["mr4dams", "twitchmusicid", this.channels.client?.currentNick].includes(channel);
+        const isHostChannel = ["mr4dams", "twitchmusicid", this.channels.client?.currentNick?.toLowerCase()].includes(channel);
         const command = message.toLowerCase().split(" ")[0];
         const target = message.toLowerCase().split(" ")[1];
 
-        // Handle identifications for different Channels
-        if (isHostChannel && ["!song", "!id", "!identify"].includes(command)) {
-            if (!target) return client.action(channel, `Missing 𝗰𝗵𝗮𝗻𝗻𝗲𝗹 parameter. Command usage: ${command} 𝗰𝗵𝗮𝗻𝗻𝗲𝗹`);
+        // Handle identification requests from host channels
+        if (isHostChannel) {
+            // Abort if message does not contain one of these commands
+            if (!["!song", "!id", "!identify"].includes(command))
+                return client.action(
+                    channel,
+                    `Want to know what song is playing in a channel? Type !song <channel> – Want me in your chat? → https://adams.sh/id`,
+                );
 
-            return this.identify(channel, target, user, message, client);
+            // Check if a `target` was specified
+            if (!target) return client.action(channel, `Please provide a channel name! Command usage: ${command} <channel>`);
+
+            // Check if Channel is live
+            const stream = await this.api?.helix?.streams?.getStreamByUserName(target);
+            if (!stream) return client.action(channel, `${target} seems to be offline. Please try again with a live channel.`);
+
+            // TODO: Remove `provider` parameter after testing period
+            return this.identify(channel, target, user, message, client, message.toLowerCase().split(" ")[2]?.toUpperCase());
         }
 
         // Get Configuration for current Channel
@@ -41,8 +60,36 @@ export default class MessageHandler {
             return;
         }
 
+        // Handle Resets
+        // if (command === "!reload" && user.isMod) {
+        //     signale.warn(`Reloading configuration for ${channel}`);
+
+        //     try {
+        //         await this.channels.updateChannel(config.id);
+
+        //         signale.success(`Successfully reloaded configuration for ${channel}`);
+        //         config.actions
+        //             ? client.action(channel, `Successfully reloaded channel configuration for ${channel}.`)
+        //             : client.say(channel, `Successfully reloaded channel configuration for ${channel}.`);
+        //     } catch (error) {
+        //         signale.error(`Error reloading configuration for \`${channel}\``);
+        //         Sentry.captureException(new Error(`Error reloading configuration for \`${channel}\``));
+
+        //         config.actions
+        //             ? client.action(channel, `An error occurred reloading the channel configuration for ${channel}.`)
+        //             : client.say(channel, `An error occurred reloading the channel configuration for ${channel}.`);
+        //     }
+        // }
+
         // Handle Identifications
         if (config.triggers.some((trigger) => message.toLowerCase().includes(trigger.keyword))) {
+            // Check if Channel is live
+            const stream = await this.api?.helix?.streams?.getStreamByUserName(channel);
+            if (!stream)
+                return config.actions
+                    ? client.action(channel, `${channel} seems to be offline. Please try again with a live channel.`)
+                    : client.say(channel, `${channel} seems to be offline. Please try again with a live channel.`);
+
             this.identify(channel, channel, user, message, client);
         }
     }
@@ -54,9 +101,17 @@ export default class MessageHandler {
      * @param user ChatUser who requested identification
      * @param message Message used to start identification
      * @param client ChatClient to respond with
+     * @param provider Provider to use to identify Songs
      * @returns A Promise resolving nothing
      */
-    public async identify(host: string, target: string, user: ChatUser, message: string, client: ChatClient): Promise<void> {
+    public async identify(
+        host: string,
+        target: string,
+        user: ChatUser,
+        message: string,
+        client: ChatClient,
+        provider?: string,
+    ): Promise<void> {
         signale.start(`Song identification requested for Channel \`${target}\` by \`${user.userName}\``);
 
         // If identification was requested for the Channel the command was sent in
@@ -97,8 +152,14 @@ export default class MessageHandler {
 
                 signale.await("Waiting for results");
 
+                // Forcefully reset Channels `pending` and `cooldownNotice` state after 10 seconds
+                setTimeout(() => {
+                    this.channels.pending.set(config.id, false);
+                    this.channels.cooldownNotice.set(config.id, false);
+                }, 10000);
+
                 // Identify Songs for targetChannel
-                const identification = await this.identifier.identify(target, user.userName, message);
+                const identification = await this.identifier.identify(target, user.userName, message, provider);
                 const { songs } = identification;
 
                 songs.length > 0
@@ -147,25 +208,26 @@ export default class MessageHandler {
                 signale.await("Waiting for results");
 
                 // Identify Songs for targetChannel
-                const identification = await this.identifier.identify(target, user.userName, message);
+                const identification = await this.identifier.identify(target, user.userName, message, provider);
                 const { songs } = identification;
+                const song = songs[0];
 
-                songs.length > 0
+                song
                     ? signale.success(`Identified ${songs.length} Songs for target Channel \`${target}\``)
                     : signale.warn(`Could not identify any Songs for target Channel \`${target}\``);
 
-                return songs.length > 0
-                    ? client.action(host, `@${user.displayName} → Detected "${songs[0].title}" by ${songs[0].artists}`).then(() => {
+                return song
+                    ? client.action(host, `${target} is currently playing "${song.title}" by ${song.artists} → ${song.url}`).then(() => {
                           signale.success(`Sent response in Channel \`${host}\``);
                       })
-                    : client.action(host, `@${user.displayName} → Could not identify any Songs`).then(() => {
+                    : client.action(host, `Could not identify Songs in Channel ${target}`).then(() => {
                           signale.success(`Sent response in Channel \`${host}\``);
                       });
             } catch (error) {
-                Sentry.captureException(error);
-
                 signale.error(`Unexpected error while identifying Songs in target Channel \`${target}\``);
                 signale.error(error);
+
+                Sentry.captureException(error);
 
                 client.action(host, `@${user.displayName} → Unexpected error: ${error.message}`).then(() => {
                     signale.success(`Sent error message in Channel \`${host}\``);
